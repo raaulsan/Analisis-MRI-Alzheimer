@@ -79,7 +79,7 @@ estándar **MNI-ICBM152** mediante una transformación afín de 12 DOF:
 ### 5. 📊 Análisis Longitudinal
 Cálculo de la **tasa de atrofia anual** para cada paciente:
 
-$$\tau = \frac{V_2 - V_1}{V_1 \cdot \Delta t} \times 100  [\%/\text{año}]$$
+$$\tau = \frac{V_2 - V_1}{V_1 \cdot \Delta t} \times 100  
 
 Aplicado sobre dos biomarcadores independientes:
 - **Ventrículos laterales** (segmentación clásica, 76/77 pacientes)
