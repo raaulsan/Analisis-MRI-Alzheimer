@@ -15,31 +15,81 @@ Este proyecto ha sido desarrollado colaborativamente por:
 * **Raúl Sánchez Ibáñez** - [![GitHub](https://img.shields.io/badge/GitHub-181717?style=for-the-badge&logo=github&logoColor=white)](https://github.com/raaulsan)
 
 ---
-
 ## 🏗️ Arquitectura del Pipeline
 
-Nuestro enfoque aborda y soluciona varios de los desafíos clásicos en el procesamiento de imágenes médicas (*Medical Image Computing*), dividiendo el flujo de trabajo en 4 fases críticas:
+El pipeline se divide en **6 etapas encadenadas**, diseñadas para procesar 
+cada par longitudinal (V1/V2) de forma completamente automatizada.
 
-### 1. Preprocesamiento y Normalización Robusta
-Los datos crudos de MRI presentan alta variabilidad de contraste. Implementamos una normalización robusta basada en el análisis de histogramas 3D.
-* **Filtro de Fondo:** Eliminación del ruido del aire (< 10% del percentil).
-* **Clipping de Percentiles (1-99%):** Recorte de artefactos extremos.
-* **Escalado Min-Max:** Estandarización de la densidad de tejido al rango `[0, 1]`.
+### 1. 📐 Preprocesamiento Robusto (P01/P02)
+Las imágenes T1 de OASIS-2 presentan alta variabilidad de contraste entre 
+sujetos y sesiones. Una normalización Min-Max estándar es sensible a 
+artefactos de adquisición, por lo que implementamos una **normalización 
+robusta por percentiles**:
+- Recorte del 1% inferior y superior de la distribución de intensidades 3D
+- Mapeo lineal del rango residual `[p1, p99]` → `[0, 1]`
+- Produce histogramas comparables entre sujetos, condición necesaria para 
+  que los umbrales de segmentación sean transferibles entre visitas
 
-### 2. Registro Intra-Sujeto (Alineación Longitudinal)
-Para poder comparar la visita del Año 1 con la del Año 2, es imperativo alinear ambas cabezas milimétricamente en el mismo espacio físico.
-* **Header Stripping:** Solucionamos problemas de metadatos corruptos (comunes en el formato Analyze 7.5 antiguo) extrayendo las matrices puras con `nibabel` e inicializando geometrías neutras.
-* **SimpleITK Registration:** Utilizamos *Mattes Mutual Information* y descenso de gradiente, inicializando la transformación mediante el centro de masa real (*MOMENTS*).
+### 2. 📍 Registro Intra-Sujeto Rígido (P03)
+Para que las diferencias de volumen entre visitas reflejen cambios reales 
+y no artefactos de posicionamiento, alineamos V2 al espacio de V1 mediante 
+una **transformación rígida de 6 DOF** (3 traslaciones + 3 rotaciones):
+- **Métrica:** Información Mutua de Mattes (robusta frente a diferencias 
+  de contraste entre sesiones)
+- **Optimizador:** Regular Step Gradient Descent (200 iteraciones)
+- **Inicialización:** `CenteredTransformInitializer` por momentos, para 
+  evitar mínimos locales
+- **Resultado:** NCC +104%, MSE −52% tras registro sobre el paciente de 
+  referencia
 
-### 3. El Desafío del "Skull Stripping" y la Decisión de Diseño
-Experimentamos con métodos clásicos (Multi-Otsu, erosiones morfológicas asimétricas y rechazo estadístico espacial mediante Z-Scores 3D) para extraer el cerebro. 
-Documentamos un límite fundamental: la similitud de intensidades y conectividad física entre la cara/cuello y el córtex provoca que los métodos matemáticos globales sean propensos a generar artefactos anatómicos. Esto nos llevó a **pivotar hacia Foundation Models**.
+> Comparamos experimentalmente tres métodos (rígido, afín y deformable 
+> Demons). El rígido se selecciona por ofrecer la mejor relación 
+> calidad/coste: Demons mejora las métricas fotométricas un 4% en NCC pero 
+> triplica el tiempo de cómputo y puede absorber la atrofia real en el campo 
+> de deformación, sesgando las tasas a la baja.
 
-### 4. Segmentación "Zero-Shot" con MedSAM
-Para superar los límites de la visión clásica, integramos **MedSAM** sin necesidad de reentrenamiento (*Zero-Shot Inference*), utilizando una estrategia de *Doble Prompting Automático*:
-* **Fase Macro (Cerebro Completo):** Utilizamos máscaras de Otsu recicladas para calcular un *Bounding Box* matemático, permitiendo a MedSAM aislar el cerebro e ignorar el cráneo.
-* **Fase Micro (Ventrículos):** Calculamos el centroide de la masa cerebral y lo inyectamos como un *Point Prompt*. MedSAM segmenta los ventrículos con precisión, permitiéndonos calcular su volumen exacto y la atrofia longitudinal de los pacientes.
+### 3. 🧩 Segmentación Ventricular (P04)
+Segmentación automática de los ventrículos laterales explotando el alto 
+contraste del CSF en T1, con dos **correcciones de consistencia longitudinal** 
+propias:
 
+**Algoritmo base (3 pasos):**
+1. Máscara cerebral por umbral + componente conexo + cierre morfológico
+2. Umbral CSF = percentil 12 dentro de la máscara cerebral
+3. Filtrado por tamaño mínimo (≥500 vóxeles) y distancia al centro cerebral
+
+**Correcciones longitudinales (aportación propia):**
+- *Histogram matching* de V2 sobre V1 (1024 niveles, 7 puntos de ajuste)
+- *Prior espacial*: búsqueda en V2 restringida a dilatación de 8 vóxeles 
+  sobre la máscara de V1
+
+**Validación cruzada con MedSAM:** el prompt de bounding box se genera 
+automáticamente a partir de la segmentación clásica, sin anotación manual, 
+y se pasa al `SamImageProcessor` de HuggingFace.
+
+### 4. 🗺️ Registro Inter-Sujeto al Atlas MNI (Atlas)
+Para comparar volúmenes entre pacientes, llevamos cada cerebro al espacio 
+estándar **MNI-ICBM152** mediante una transformación afín de 12 DOF:
+- Inversión de la transformación → propagación de la máscara hipocampal 
+  bilateral del atlas **Harvard-Oxford** (etiquetas 9 y 19) al espacio nativo
+- Como V2 ya está alineada a V1, el ROI hipocampal es idéntico en ambas 
+  visitas: cualquier reducción de tejido refleja atrofia real
+- Cobertura: 50/50 pacientes con resultado válido
+
+### 5. 📊 Análisis Longitudinal
+Cálculo de la **tasa de atrofia anual** para cada paciente:
+
+$$\tau = \frac{V_2 - V_1}{V_1 \cdot \Delta t} \times 100 \quad [\%/\text{año}]$$
+
+Aplicado sobre dos biomarcadores independientes:
+- **Ventrículos laterales** (segmentación clásica, 76/77 pacientes)
+- **Hipocampo bilateral** (propagación atlas MNI, 50 pacientes)
+
+### 6. ✅ Validación Clínica
+Correlación de los biomarcadores de imagen con las escalas clínicas del CSV:
+- Correlación de Pearson y Spearman con **CDR** y **MMSE**
+- Test de **Mann-Whitney U** entre grupos Demented / Nondemented
+- Análisis de *converters* (Nondemented en V1 → Demented en V2)
 ---
 
 ## 🚀 Tecnologías Utilizadas
